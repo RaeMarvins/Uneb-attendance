@@ -11,7 +11,7 @@ except ImportError:
     st.stop()
 
 # ------------------------------------------------------------
-# PARSER WITH DEBUG AND FALLBACK
+# ROBUST PARSER – extracts all teachers line by line
 # ------------------------------------------------------------
 @st.cache_data
 def parse_pdf(pdf_file):
@@ -19,128 +19,97 @@ def parse_pdf(pdf_file):
     debug_info = {}
 
     with pdfplumber.open(pdf_file) as pdf:
+        full_text = ""
         for page_num, page in enumerate(pdf.pages, start=1):
-            # 1. Try table extraction
-            tables = page.extract_tables()
-            if tables:
-                debug_info[f"page_{page_num}_tables"] = tables
-                for table in tables:
-                    if not table:
-                        continue
-                    # Try to find header with "No" and "Name"
-                    header = table[0]
-                    try:
-                        no_idx = next(i for i, col in enumerate(header) if col and 'No' in col)
-                        name_idx = next(i for i, col in enumerate(header) if col and 'Name' in col)
-                    except StopIteration:
-                        continue
-
-                    # The remaining columns should be paired (in/out per day)
-                    # We'll extract all date-like strings from the header
-                    date_cols = []
-                    for i, col in enumerate(header):
-                        if i not in (no_idx, name_idx) and col:
-                            if re.search(r'\d{4}/\d{2}/\d{2}', col):
-                                date_cols.append(i)
-
-                    # For each data row
-                    for row in table[1:]:
-                        if not row or len(row) < 2:
-                            continue
-                        no = str(row[no_idx]).strip() if row[no_idx] else ''
-                        name = str(row[name_idx]).strip() if row[name_idx] else ''
-                        if not name or not no:
-                            continue
-
-                        # For each date column, the next cell might be the out time
-                        # But if the date header is merged, we might have only one column per date
-                        # We'll try to get both in and out from the cell or the next cell
-                        for i in date_cols:
-                            in_time = out_time = None
-                            if i < len(row):
-                                cell = str(row[i]).strip() if row[i] else ''
-                                # Find times
-                                times = re.findall(r'\d{2}:\d{2}', cell)
-                                if len(times) >= 1:
-                                    in_time = times[0]
-                                if len(times) >= 2:
-                                    out_time = times[1]
-                                # If only one time, check next cell for out
-                                if len(times) == 1 and i+1 < len(row):
-                                    next_cell = str(row[i+1]).strip() if row[i+1] else ''
-                                    if re.search(r'\d{2}:\d{2}', next_cell):
-                                        out_time = re.search(r'\d{2}:\d{2}', next_cell).group()
-                            if in_time or out_time:
-                                # We need the date label; we can derive from header but we might not have it
-                                # We'll use the column index as placeholder; later we'll map to actual dates
-                                date_label = f"Day_{i}"  # temporary
-                                all_rows.append({
-                                    'No': no,
-                                    'Name': name,
-                                    'Date': date_label,
-                                    'SignIn': in_time,
-                                    'SignOut': out_time
-                                })
-
-            # 2. If we got rows from tables, skip fallback
-            if all_rows:
-                continue
-
-            # 3. Fallback: extract raw text and parse line by line
             text = page.extract_text()
             if text:
-                debug_info[f"page_{page_num}_text"] = text
-                lines = text.split('\n')
-                # We expect each teacher on a line like "001KARAMAGI JAMES08:28 21:05..."
-                # But lines may have spaces; we'll try to find patterns
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    # Try to match No and Name at start
-                    # Pattern: digits followed by a name (letters and spaces), then the rest
-                    m = re.match(r'^(\d+)\s*([A-Za-z ]+?)(\d{2}:\d{2}.*)', line)
-                    if not m:
-                        # Maybe there is no space between number and name
-                        m = re.match(r'^(\d+)([A-Za-z ]+?)(\d{2}:\d{2}.*)', line)
-                    if m:
-                        no = m.group(1)
-                        name = m.group(2).strip()
-                        rest = m.group(3)
-                        # Now extract all tokens: either a time or a dash
-                        tokens = re.findall(r'(\d{2}:\d{2}|-)', rest)
-                        # We will pair tokens into (in,out) pairs
-                        # We need to know how many days; we can try to infer from the header
-                        # For now, assume 5 days (since we know the report is week 5)
-                        # But we'll just pair sequentially; if odd number, last has only in
-                        pairs = []
-                        for i in range(0, len(tokens), 2):
-                            if i+1 < len(tokens):
-                                pairs.append((tokens[i], tokens[i+1]))
-                            else:
-                                pairs.append((tokens[i], None))
-                        # Assign to days (we don't know actual dates; we'll use Day1..Day5)
-                        for idx, (in_time, out_time) in enumerate(pairs, start=1):
-                            if in_time or out_time:
-                                all_rows.append({
-                                    'No': no,
-                                    'Name': name,
-                                    'Date': f'Day{idx}',
-                                    'SignIn': in_time if in_time != '-' else None,
-                                    'SignOut': out_time if out_time != '-' else None
-                                })
+                full_text += text + "\n"
+                debug_info[f"page_{page_num}_text_sample"] = text[:500]  # first 500 chars
 
-    # Convert to DataFrame
+        # Split into lines
+        lines = full_text.split('\n')
+        debug_info["total_lines"] = len(lines)
+
+        # We'll try to find the date header to map days
+        # The header has "2026/03/09" ... "2026/03/13"
+        date_pattern = r'(\d{4}/\d{2}/\d{2})'
+        all_dates = re.findall(date_pattern, full_text)
+        # Assume the first 5 unique dates are the week
+        unique_dates = list(dict.fromkeys(all_dates))  # preserve order
+        if len(unique_dates) >= 5:
+            dates = unique_dates[:5]
+        else:
+            # fallback: hardcode the known week
+            dates = ['2026/03/09', '2026/03/10', '2026/03/11', '2026/03/12', '2026/03/13']
+        debug_info["dates_used"] = dates
+
+        # Process each line
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Find all time tokens (HH:MM) and dashes (-)
+            tokens = re.findall(r'(\d{2}:\d{2}|-)', line)
+            if not tokens:
+                continue
+
+            # Find the position of the first token to separate number+name
+            first_token = tokens[0]
+            idx = line.find(first_token)
+            if idx == -1:
+                continue
+
+            # The part before first token contains number and name
+            prefix = line[:idx].strip()
+            # Extract number (leading digits)
+            num_match = re.match(r'^(\d+)', prefix)
+            if not num_match:
+                continue
+            no = num_match.group(1)
+            # The rest is the name
+            name = prefix[len(no):].strip()
+            if not name:
+                # If name is empty, skip
+                continue
+
+            # Pair tokens into (in, out) for each day
+            # We expect 5 days, but we'll just pair sequentially
+            pairs = []
+            for i in range(0, len(tokens), 2):
+                in_time = tokens[i] if tokens[i] != '-' else None
+                out_time = tokens[i+1] if i+1 < len(tokens) and tokens[i+1] != '-' else None
+                pairs.append((in_time, out_time))
+
+            # Assign to the 5 dates (pad with None if fewer days)
+            for day_idx, (in_time, out_time) in enumerate(pairs):
+                if day_idx >= len(dates):
+                    break
+                date_str = dates[day_idx]
+                all_rows.append({
+                    'No': no,
+                    'Name': name,
+                    'Date': date_str,
+                    'SignIn': in_time,
+                    'SignOut': out_time
+                })
+
+            # If we have fewer pairs than dates, we can optionally add rows with None, but that would inflate attendance counts.
+            # We'll only add rows where at least one time exists (already done)
+
     df = pd.DataFrame(all_rows)
     if not df.empty:
-        # Try to convert Date to actual dates if we have them from header
-        # For now, we keep as string; later we can map
-        df['Date'] = df['Date'].astype(str)
+        df['Date'] = pd.to_datetime(df['Date'])
         df = df.sort_values(['No', 'Date']).reset_index(drop=True)
+
+    # Add debug info about teachers found
+    debug_info["teachers_found"] = df['Name'].unique().tolist() if not df.empty else []
+    debug_info["total_teachers"] = len(debug_info["teachers_found"])
+
     return df, debug_info
 
 # ------------------------------------------------------------
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (same as before)
 # ------------------------------------------------------------
 def is_late(time_str, threshold='08:00'):
     if not time_str or time_str == '-':
@@ -165,7 +134,7 @@ def compute_summary(df):
     return summary, total_days
 
 # ------------------------------------------------------------
-# STREAMLIT DASHBOARD
+# STREAMLIT DASHBOARD (same UI, with extra debug)
 # ------------------------------------------------------------
 st.set_page_config(page_title="Teacher Attendance Dashboard", layout="wide")
 st.title("📋 Teacher Attendance Dashboard – Term 1, Week 5 (9–13 March 2026)")
@@ -176,15 +145,19 @@ if uploaded_file is not None:
     with st.spinner("Parsing PDF ..."):
         df, debug = parse_pdf(uploaded_file)
 
-    # Show debug info (expandable)
-    with st.expander("🔍 Debug: Raw Extracted Data"):
-        st.write("Number of rows extracted:", len(df))
-        if df.empty:
-            st.warning("No attendance data found. Debug info below may help.")
-        st.write("Debug dictionary (tables, text, etc.):")
-        st.json(debug)  # show raw tables/text if any
+    # Debug expander
+    with st.expander("🔍 Debug Info"):
+        st.write(f"**Total lines extracted:** {debug.get('total_lines', 0)}")
+        st.write(f"**Teachers found:** {debug.get('total_teachers', 0)}")
+        if debug.get('teachers_found'):
+            st.write("**Names found:**")
+            st.write(debug['teachers_found'])
+        st.write("**Dates used:**", debug.get('dates_used', []))
+        st.write("**Raw text sample (first 500 chars):**")
+        st.text(debug.get('page_1_text_sample', 'No text extracted'))
 
     if df.empty:
+        st.warning("No attendance data found. Please check the debug info above.")
         st.stop()
 
     with st.expander("📄 View Extracted Data"):
